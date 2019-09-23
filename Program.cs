@@ -8,7 +8,10 @@ namespace MassPullRequest
 {
     class Program
     {
-        private static int Run(CommandLineApplication app, CommandOption repos, CommandOption reposFile, bool doCommit, CommandOption changesBranch, CommandOption commitMessage, bool createPr) {
+        private static int Run(
+            CommandLineApplication app, CommandOption repos, CommandOption reposFile, bool doCommit, CommandOption baseBranch,
+            CommandOption changesBranch, CommandOption commitMessage, bool createPr, string commandToRun) 
+        {
             if(!TryLoadUrls(repos, reposFile, out var urls)) {
                 return 1;
             } else if (!urls.Any()) {
@@ -33,7 +36,38 @@ namespace MassPullRequest
                 return 1;
             }
 
+            foreach(var repoUrl in urls) {
+                var checkoutDir = CloneRepository(repoUrl);
+                
+                RunCommand(repoUrl, checkoutDir, commandToRun, baseBranch.Value());
+
+                if(doCommit) {
+                    CreateCommit(repoUrl, checkoutDir, commitMessage.Value(), changesBranch.Value());
+                }
+
+                if(createPr) {
+                    CreatePullRequest(repoUrl, checkoutDir, changesBranch.Value(), baseBranch.Value());
+                }
+            }
+
             return 0;
+        }
+
+        private static DirectoryInfo CloneRepository(Uri url) {
+            Console.WriteLine($"Cloning {url}");
+            return new DirectoryInfo(".");
+        }
+
+        private static void RunCommand(Uri url, DirectoryInfo checkoutDir, string command, string baseBranch = null) {
+            Console.WriteLine($"Running command for {url}");
+        }
+
+        private static void CreateCommit(Uri url, DirectoryInfo checkoutDir, string commitMessage, string changesBranch = null) {
+            Console.WriteLine($"Committing changes for {url}" + changesBranch != null ? $" on {changesBranch}" : "");
+        }
+
+        private static void CreatePullRequest(Uri url, DirectoryInfo checkoutDir, string changesBranch, string baseBranch = null) {
+            Console.WriteLine($"Sending pull request for {url} {changesBranch} -> {baseBranch ?? "<default>"}");
         }
 
         private static bool TryLoadUrls(CommandOption repos, CommandOption reposFile, out IReadOnlyList<Uri> urls) {
@@ -73,7 +107,7 @@ namespace MassPullRequest
 
             app.HelpOption("-?|-h|--help");
 
-            app.Argument("Command", "The command to be executed on each repostitory", false);
+            var command = app.Argument("Command", "The command to be executed on each repostitory", false);
 
             var repos = app.Option("--repo <url>", 
                     "A set of repositories on which to execute the required action.",
@@ -88,7 +122,7 @@ namespace MassPullRequest
             var changesBranch = app.Option("--changes-branch <branchName>", "The branch name on which to commit changes caused by the specified command. To be used in conjunction with --commit or --pull-request", CommandOptionType.SingleValue);
             var message = app.Option("--commit-message <message>","The message to use when commiting changes. Required when using --commit or --pull-request", CommandOptionType.SingleValue);
 
-            app.OnExecute(() => Run(app, repos, reposFile, doCommit.HasValue() || createPullRequest.HasValue(), changesBranch, message, createPullRequest.HasValue()));
+            app.OnExecute(() => Run(app, repos, reposFile, doCommit.HasValue() || createPullRequest.HasValue(), baseBranch, changesBranch, message, createPullRequest.HasValue(), command.Value);
 
             try
             {
