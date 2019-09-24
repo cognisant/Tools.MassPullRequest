@@ -13,76 +13,105 @@ namespace MassPullRequest
     class Program
     {
         private static int Run(
-            CommandLineApplication app, CommandOption repos, CommandOption reposFile, bool doCommit, CommandOption baseBranch,
-            CommandOption changesBranch, CommandOption commitMessage, bool pushChanges, bool createPr, string commandToRun) 
+            CommandLineApplication app, CommandOption repos, CommandOption reposFile, bool doCommit, CommandOption baseBranchName,
+            CommandOption changesBranchName, CommandOption commitMessage, bool createPr, string commandToRun)
         {
-            if(!TryLoadUrls(repos, reposFile, out var urls)) {
+            if (!TryLoadUrls(repos, reposFile, out var urls))
+            {
                 return 1;
-            } else if (!urls.Any()) {
-                Console.WriteLine("No repository urls provided.");
+            }
+            else if (!urls.Any())
+            {
+                Console.Error.WriteLine("Error: No repository urls provided.");
                 app.ShowHelp();
                 return 1;
             }
 
-            if(doCommit && !commitMessage.HasValue()) {
-                Console.WriteLine("Specify a commit message with --commit-message when using --commit or --pull-request");
+            if (doCommit && !commitMessage.HasValue())
+            {
+                Console.Error.WriteLine("Error: Specify a commit message with --commit-message when using --commit or --pull-request");
                 app.ShowHelp();
                 return 1;
             }
 
-            if(createPr && !changesBranch.HasValue()) {
-                Console.WriteLine("Specify a branch to create with --changes-branch when using --pull-request");
+            if (createPr && !changesBranchName.HasValue())
+            {
+                Console.Error.WriteLine("Error: Specify a branch to create with --changes-branch when using --pull-request");
                 app.ShowHelp();
                 return 1;
             }
 
-            Console.WriteLine("Enter git username: ");
-            var userName = Console.ReadLine();
-            Console.WriteLine("Enter git password: ");
-            var password = GetHiddenConsoleInput();
+            var credentials = GetCredentials();
 
-            var credentials = new UsernamePasswordCredentials() { Username = userName, Password = password };
-
-            foreach(var repoUrl in urls) {
+            foreach (var repoUrl in urls)
+            {
                 var repo = CloneRepository(repoUrl, credentials);
-                
-                if(baseBranch.HasValue()) {
-                    CheckoutBaseBranch(repo, baseBranch.Value());
+
+                if (baseBranchName.HasValue())
+                {
+                    CheckoutBaseBranch(repo, baseBranchName.Value());
                 }
 
                 RunCommand(repoUrl, repo, commandToRun);
 
-                if(doCommit) {
-                    CreateCommit(repoUrl, repo, commitMessage.Value(), credentials, changesBranch.Value());
+                var changes = repo.RetrieveStatus(new LibGit2Sharp.StatusOptions());
+                if (!doCommit || !changes.Any())
+                {
+                    continue;
                 }
 
-                if(createPr) {
-                    CreatePullRequest(repoUrl, repo, changesBranch.Value(), credentials, baseBranch.Value());
+                Console.WriteLine($"Committing {changes.Count()} changed files.");
+                var changesBranch = CheckoutChangesBranch(repo, changesBranchName.Value());
+                CreateCommit(repo, commitMessage.Value(), credentials);
+                PushChanges(repo, changesBranch, credentials);
+
+                if (createPr)
+                {
+                    CreatePullRequest(repoUrl, repo, changesBranchName.Value(), credentials, baseBranchName.Value());
                 }
             }
 
             return 0;
         }
 
+        private static UsernamePasswordCredentials GetCredentials()
+        {
+            Console.Write("Enter git username: ");
+            var userName = Console.ReadLine();
+            Console.Write("Enter git password: ");
+            var password = GetHiddenConsoleInput();
+            Console.WriteLine();
+
+            var credentials = new UsernamePasswordCredentials() { Username = userName, Password = password };
+            return credentials;
+        }
+
         private static Repository CloneRepository(Uri url, UsernamePasswordCredentials credentials) {
             Console.WriteLine($"Cloning {url}");
             var co = new CloneOptions();
-            co.CredentialsProvider = (_url, _user, _cred) => credentials;
+            
+            co.CredentialsProvider = (_, __, ___) => credentials;
             var cloneDirectory = url.ToString().Split("/").Last(x => !string.IsNullOrWhiteSpace(x));
             var repoPath = Repository.Clone(url.ToString(), cloneDirectory, co);
             return new Repository(repoPath);
         }
 
         private static void CheckoutBaseBranch(Repository repo, string branchName) {
-            var branchExists = repo.Branches.Any(b => b.FriendlyName.Equals(branchName, StringComparison.CurrentCultureIgnoreCase));
-            
-            Console.WriteLine($"Changing to {(branchExists ? "new" : "pre-existing")} base branch {branchName}");
-            
-            if(branchExists) {
-                Commands.Checkout(repo, repo.Branches[branchName]);
-            } else {
-                Console.WriteLine($"WARN: base branch {branchName} did not exist, running against default branch.");
+            var localBranch = repo.Branches[branchName];
+
+            if(localBranch == null) {
+                // Probably a remote branch
+                Branch trackedBranch = repo.Branches[$"origin/{branchName}"];
+
+                if(trackedBranch == null) {
+                    throw new Exception($"Branch {branchName} not found locally or on origin.");
+                }
+
+                localBranch = repo.CreateBranch(branchName, trackedBranch.Tip);
+                repo.Branches.Update(localBranch, b => b.UpstreamBranch = $"refs/heads/{branchName}");
             }
+
+            Commands.Checkout(repo, repo.Branches[branchName]);
         }
 
         private static void RunCommand(Uri url, Repository repo, string command) {
@@ -96,7 +125,7 @@ namespace MassPullRequest
                 StartInfo = new ProcessStartInfo
                 {
                     FileName = runner,
-                    Arguments = $"{(runner == "powershell" ? "??" : "-c")} \"{escapedArgs}\"",
+                    Arguments = $"{(runner == "powershell" ? "-Command" : "-c")} \"{escapedArgs}\"",
                     RedirectStandardOutput = true,
                     RedirectStandardError = true,
                     UseShellExecute = false,
@@ -114,13 +143,63 @@ namespace MassPullRequest
             process.WaitForExit();
         }
 
-        private static void CreateCommit(Uri url, Repository checkoutDir, string commitMessage, UsernamePasswordCredentials credentials, string changesBranch = null) {
-            Console.WriteLine($"Committing changes for {url}" + changesBranch != null ? $" on {changesBranch}" : "");
+        private static Branch CheckoutChangesBranch(Repository repo, string changesBranch) {
+            //need to make sure that the changes branch name is unique both locally and remote
+            var branchName = changesBranch;
+            Branch localBranch;
+            Branch trackedBranch;
+
+            var i = 0;
+            do {
+                i++;
+                // if branch name is taken we'll try branchname-2, branchname-3 etc
+                branchName = $"{changesBranch}{(i==1 ? "" : "-" + i)}";
+                localBranch = repo.Branches[branchName];
+                trackedBranch = repo.Branches[$"origin/{branchName}"];
+            } while (localBranch != null || trackedBranch != null);
+
+            if(i != 1) {
+                Console.WriteLine($"Branch name {changesBranch} was in use, checked out {changesBranch}-{i} instead.");
+            }
+
+            localBranch = repo.CreateBranch(branchName);
+            repo.Branches.Update(localBranch, b => b.UpstreamBranch = $"refs/heads/{branchName}");
+
+            Commands.Checkout(repo, repo.Branches[branchName]);
+
+            return localBranch;
+        }
+
+        private static void CreateCommit(Repository repo, string commitMessage, UsernamePasswordCredentials credentials) 
+        {
+            Commands.Stage(repo, "*"); //equivalent of "git add ."
+
+            // Get author from config
+            Configuration config = repo.Config;
+            Signature author = config.BuildSignature(DateTimeOffset.Now);
+            repo.Commit(commitMessage, author, author);
+        }
+
+        private static void PushChanges(Repository repo, Branch branchToPush, UsernamePasswordCredentials credentials) 
+        {   
+            Console.WriteLine("Pushing changes.");
+            repo.Branches.Update(branchToPush,
+                 b => {
+                     b.UpstreamBranch = branchToPush.CanonicalName;
+                     b.Remote = repo.Network.Remotes["origin"].Name;
+                });
+
+            LibGit2Sharp.PushOptions options = new LibGit2Sharp.PushOptions() {
+                CredentialsProvider = (_,__,___) => credentials,
+            };
+            
+            repo.Network.Push(branchToPush, options);
         }
 
         private static void CreatePullRequest(Uri url, Repository checkoutDir, string changesBranch, UsernamePasswordCredentials credentials, string baseBranch = null) {
             // we will need to use octokit for this
             Console.WriteLine($"Sending pull request for {url} {changesBranch} -> {baseBranch ?? "<default>"}");
+
         }
 
         private static string GetHiddenConsoleInput()
@@ -147,7 +226,7 @@ namespace MassPullRequest
                 if(File.Exists(filePath)) {
                     repoList.AddRange(File.ReadAllLines(filePath).Where(l => !string.IsNullOrWhiteSpace(l)));
                 } else {
-                    Console.WriteLine($"ERROR: Repo file not found at {filePath}.");
+                    Console.Error.WriteLine($"Error: Repo file not found at {filePath}.");
                     return false;
                 }
             }
@@ -156,7 +235,7 @@ namespace MassPullRequest
 
             if(invalidUris.Any()) {
                 foreach(var uri in invalidUris) {
-                    Console.WriteLine($"ERROR: Invalid URI {uri}");
+                    Console.Error.WriteLine($"Error: Invalid URI {uri}");
                 }
                 return false;
             }
@@ -182,7 +261,6 @@ namespace MassPullRequest
             var reposFile = app.Option("--repo-file <path>", "A file containing a list of repository URLs on which to execute the specified action (one url per line).", CommandOptionType.SingleValue);
 
             var doCommit = app.Option("--commit", "Set this flag to create a commit with changes to the repository. If using this flag, a commit message must be set with --commit-message.", CommandOptionType.NoValue);
-            var pushChanges = app.Option("--push", "Set this flag to push changes. Implies --commit", CommandOptionType.NoValue);
             var createPullRequest = app.Option("--pull-request","Set this flag to create a pull request with changes to the repository. If using this flag, branch name and commit message must be set with --changes-branch and --commit-message. Implies --commit and --push.", CommandOptionType.NoValue);
 
             var baseBranch = app.Option("--base-branch <branchName>", "The branch name to be checked out before running the specified command", CommandOptionType.SingleValue);
@@ -190,7 +268,7 @@ namespace MassPullRequest
             var message = app.Option("--commit-message <message>","The message to use when commiting changes. Required when using --commit or --pull-request", CommandOptionType.SingleValue);
 
             app.OnExecute(() => Run(app, repos, reposFile, doCommit.HasValue() || createPullRequest.HasValue(), baseBranch, changesBranch, message, 
-                                    pushChanges.HasValue() || createPullRequest.HasValue(), createPullRequest.HasValue(), command.Value));
+                                    createPullRequest.HasValue(), command.Value));
 
             try
             {
@@ -202,7 +280,7 @@ namespace MassPullRequest
             }
             catch (Exception ex)
             {
-                Console.WriteLine("Unable to execute application: {0}", ex.Message);
+                Console.Error.WriteLine("Error: {0}", ex.Message);
             }
         }
     }
