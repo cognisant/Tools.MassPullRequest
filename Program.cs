@@ -28,7 +28,7 @@ namespace MassPullRequest
 
             app.HelpOption("-?|-h|--help");
 
-            var command = app.Argument("Command", "The command to be executed on each repostitory", false);
+            var command = app.Argument("Command", "The command to be executed on each repostitory, executed via powershell on windows, bash elsewhere.", false);
 
             var repos = app.Option(
                 "--repo <url>",
@@ -42,7 +42,7 @@ namespace MassPullRequest
 
             var baseBranch = app.Option(
                 "--base-branch <branchName>",
-                "The branch name to be checked out before running the specified command",
+                "The branch name to be checked out before running the specified command.",
                 CommandOptionType.SingleValue);
 
             var doCommit = app.Option(
@@ -52,17 +52,17 @@ namespace MassPullRequest
 
             var changesBranch = app.Option(
                 "--changes-branch <branchName>",
-                "The branch name on which to commit changes caused by the specified command. To be used in conjunction with --commit or --pull-request",
+                "The branch name on which to commit changes caused by the specified command. To be used in conjunction with --commit or --pull-request.",
                 CommandOptionType.SingleValue);
 
             var message = app.Option(
                 "--commit-message <message>",
-                "The message to use when commiting changes. Required when using --commit or --pull-request",
+                "The message to use when commiting changes. Required when using --commit or --pull-request.",
                 CommandOptionType.SingleValue);
 
             var createPullRequest = app.Option(
                 "--pull-request",
-                "Set this flag to create a pull request with changes to the repository. If using this flag, branch name and commit message must be set with --changes-branch and --commit-message. Implies --commit and --push.",
+                "Set this flag to create a pull request with changes to the repository. If using this flag, branch name and commit message must be set with --changes-branch and --commit-message. Implies --commit.",
                 CommandOptionType.NoValue);
 
             var doCleanup = app.Option(
@@ -350,8 +350,7 @@ namespace MassPullRequest
 
             repoList.AddRange(repos);
 
-            if (!string.IsNullOrWhiteSpace(reposFile))
-            {
+            if (!string.IsNullOrWhiteSpace(reposFile))            {
                 if (File.Exists(reposFile))
                 {
                     repoList.AddRange(File.ReadAllLines(reposFile).Where(l => !string.IsNullOrWhiteSpace(l)));
