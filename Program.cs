@@ -1,20 +1,28 @@
-﻿using System;
-using System.Collections.Generic;
-using System.Diagnostics;
-using System.IO;
-using System.Linq;
-using System.Runtime.InteropServices;
-using System.Text;
-using LibGit2Sharp;
-using Microsoft.Extensions.CommandLineUtils;
+﻿// <copyright file="WriteModule.cs" company="Cognisant Research">
+// Copyright (c) Cognisant Research. All rights reserved.
+// </copyright>
 
 namespace MassPullRequest
 {
+    using System;
+    using System.Collections.Generic;
+    using System.Diagnostics;
+    using System.IO;
+    using System.Linq;
+    using System.Runtime.InteropServices;
+    using System.Text;
+    using LibGit2Sharp;
+    using Microsoft.Extensions.CommandLineUtils;
+    using Octokit;
+    using Branch = LibGit2Sharp.Branch;
+    using Repository = LibGit2Sharp.Repository;
+    using Signature = LibGit2Sharp.Signature;
+
     class Program
     {
         private static int Run(
-            CommandLineApplication app, CommandOption repos, CommandOption reposFile, bool doCommit, CommandOption baseBranchName,
-            CommandOption changesBranchName, CommandOption commitMessage, bool createPr, string commandToRun)
+            CommandLineApplication app, List<string> repos, string reposFile, bool doCommit, string baseBranchName,
+            string changesBranchName, string commitMessage, bool createPr, bool cleanup, string commandToRun)
         {
             if (!TryLoadUrls(repos, reposFile, out var urls))
             {
@@ -27,14 +35,14 @@ namespace MassPullRequest
                 return 1;
             }
 
-            if (doCommit && !commitMessage.HasValue())
+            if (doCommit && string.IsNullOrWhiteSpace(commitMessage))
             {
                 Console.Error.WriteLine("Error: Specify a commit message with --commit-message when using --commit or --pull-request");
                 app.ShowHelp();
                 return 1;
             }
 
-            if (createPr && !changesBranchName.HasValue())
+            if (createPr && string.IsNullOrWhiteSpace(changesBranchName))
             {
                 Console.Error.WriteLine("Error: Specify a branch to create with --changes-branch when using --pull-request");
                 app.ShowHelp();
@@ -45,29 +53,41 @@ namespace MassPullRequest
 
             foreach (var repoUrl in urls)
             {
-                var repo = CloneRepository(repoUrl, credentials);
+                string clonePath = "";
+                try {
+                    var (repo, path) = CloneRepository(repoUrl, credentials);
+                    clonePath = path;
 
-                if (baseBranchName.HasValue())
-                {
-                    CheckoutBaseBranch(repo, baseBranchName.Value());
-                }
+                    if (!string.IsNullOrWhiteSpace(baseBranchName))
+                    {
+                        CheckoutBaseBranch(repo, baseBranchName);
+                    }
 
-                RunCommand(repoUrl, repo, commandToRun);
+                    var baseBranch = repo.Branches[repo.Head.FriendlyName];
 
-                var changes = repo.RetrieveStatus(new LibGit2Sharp.StatusOptions());
-                if (!doCommit || !changes.Any())
-                {
-                    continue;
-                }
+                    RunCommand(repoUrl, repo, commandToRun);
 
-                Console.WriteLine($"Committing {changes.Count()} changed files.");
-                var changesBranch = CheckoutChangesBranch(repo, changesBranchName.Value());
-                CreateCommit(repo, commitMessage.Value(), credentials);
-                PushChanges(repo, changesBranch, credentials);
+                    var changes = repo.RetrieveStatus(new LibGit2Sharp.StatusOptions());
+                    if (!doCommit || !changes.Any())
+                    {
+                        continue;
+                    }
 
-                if (createPr)
-                {
-                    CreatePullRequest(repoUrl, repo, changesBranchName.Value(), credentials, baseBranchName.Value());
+                    Console.WriteLine($"Committing {changes.Count()} changed files.");
+
+                    var changesBranch = CheckoutChangesBranch(repo, changesBranchName);
+                    CreateCommit(repo, commitMessage, credentials);
+                    PushChanges(repo, changesBranch, credentials);
+
+                    if (createPr)
+                    {
+                        CreatePullRequest(repoUrl, repo, baseBranch, changesBranch, commitMessage, credentials);
+                    }
+                } finally {
+                    // Wether success or failure, clean up the cloned repository
+                    if(!string.IsNullOrWhiteSpace(clonePath) && cleanup) {
+                        (new DirectoryInfo(clonePath)).Delete(true);
+                    }
                 }
             }
 
@@ -86,14 +106,14 @@ namespace MassPullRequest
             return credentials;
         }
 
-        private static Repository CloneRepository(Uri url, UsernamePasswordCredentials credentials) {
+        private static (Repository repo, string clonePath) CloneRepository(Uri url, UsernamePasswordCredentials credentials) {
             Console.WriteLine($"Cloning {url}");
             var co = new CloneOptions();
             
             co.CredentialsProvider = (_, __, ___) => credentials;
-            var cloneDirectory = url.ToString().Split("/").Last(x => !string.IsNullOrWhiteSpace(x));
+            var cloneDirectory = Path.Combine(".", url.ToString().Split("/").Last(x => !string.IsNullOrWhiteSpace(x)));
             var repoPath = Repository.Clone(url.ToString(), cloneDirectory, co);
-            return new Repository(repoPath);
+            return (new Repository(repoPath), cloneDirectory);
         }
 
         private static void CheckoutBaseBranch(Repository repo, string branchName) {
@@ -131,7 +151,7 @@ namespace MassPullRequest
                     UseShellExecute = false,
                     CreateNoWindow = true,
                     WorkingDirectory = Path.Combine(".", cloneDirectory),
-                }
+                },
             };
             
             process.OutputDataReceived += (sender, data) => Console.WriteLine(data.Data);
@@ -196,10 +216,26 @@ namespace MassPullRequest
             repo.Network.Push(branchToPush, options);
         }
 
-        private static void CreatePullRequest(Uri url, Repository checkoutDir, string changesBranch, UsernamePasswordCredentials credentials, string baseBranch = null) {
+        private static void CreatePullRequest(Uri url, Repository checkoutDir, Branch baseBranch, Branch changesBranch, string commitMessage, UsernamePasswordCredentials credentials) {
             // we will need to use octokit for this
-            Console.WriteLine($"Sending pull request for {url} {changesBranch} -> {baseBranch ?? "<default>"}");
+            Console.WriteLine($"Sending pull request for {changesBranch.FriendlyName} -> {baseBranch.FriendlyName}");
 
+            var githubCredentials = new Octokit.Credentials(credentials.Username, credentials.Password);
+
+            var client = new GitHubClient(new ProductHeaderValue("MassPullRequest"))
+            {
+                Credentials = githubCredentials
+            };
+
+            // octokit can only get a repo by owner + name, so we need to chop up the url
+
+            var urlParts = url.AbsolutePath.Split("/");
+            var repoName = urlParts.Last();
+            var owner = urlParts[urlParts.Length - 2];
+
+            var pr = new NewPullRequest(commitMessage, changesBranch.Reference.CanonicalName, baseBranch.Reference.CanonicalName);
+
+            client.PullRequest.Create(owner, repoName, pr).Wait();
         }
 
         private static string GetHiddenConsoleInput()
@@ -215,18 +251,17 @@ namespace MassPullRequest
             return input.ToString();
         }
 
-        private static bool TryLoadUrls(CommandOption repos, CommandOption reposFile, out IReadOnlyList<Uri> urls) {
+        private static bool TryLoadUrls(List<string> repos, string reposFile, out IReadOnlyList<Uri> urls) {
             urls = new List<Uri>();
             var repoList = new List<string>();
 
-            repoList.AddRange(repos.Values);
+            repoList.AddRange(repos);
             
-            if(reposFile.HasValue()) {
-                var filePath = reposFile.Value();
-                if(File.Exists(filePath)) {
-                    repoList.AddRange(File.ReadAllLines(filePath).Where(l => !string.IsNullOrWhiteSpace(l)));
+            if(!string.IsNullOrWhiteSpace(reposFile)) {
+                if(File.Exists(reposFile)) {
+                    repoList.AddRange(File.ReadAllLines(reposFile).Where(l => !string.IsNullOrWhiteSpace(l)));
                 } else {
-                    Console.Error.WriteLine($"Error: Repo file not found at {filePath}.");
+                    Console.Error.WriteLine($"Error: Repo file not found at {reposFile}.");
                     return false;
                 }
             }
@@ -260,15 +295,16 @@ namespace MassPullRequest
 
             var reposFile = app.Option("--repo-file <path>", "A file containing a list of repository URLs on which to execute the specified action (one url per line).", CommandOptionType.SingleValue);
 
-            var doCommit = app.Option("--commit", "Set this flag to create a commit with changes to the repository. If using this flag, a commit message must be set with --commit-message.", CommandOptionType.NoValue);
-            var createPullRequest = app.Option("--pull-request","Set this flag to create a pull request with changes to the repository. If using this flag, branch name and commit message must be set with --changes-branch and --commit-message. Implies --commit and --push.", CommandOptionType.NoValue);
-
             var baseBranch = app.Option("--base-branch <branchName>", "The branch name to be checked out before running the specified command", CommandOptionType.SingleValue);
+            var doCommit = app.Option("--commit", "Set this flag to create a commit with changes to the repository. If using this flag, a commit message must be set with --commit-message.", CommandOptionType.NoValue);
             var changesBranch = app.Option("--changes-branch <branchName>", "The branch name on which to commit changes caused by the specified command. To be used in conjunction with --commit or --pull-request", CommandOptionType.SingleValue);
             var message = app.Option("--commit-message <message>","The message to use when commiting changes. Required when using --commit or --pull-request", CommandOptionType.SingleValue);
+            var createPullRequest = app.Option("--pull-request","Set this flag to create a pull request with changes to the repository. If using this flag, branch name and commit message must be set with --changes-branch and --commit-message. Implies --commit and --push.", CommandOptionType.NoValue);
+            var doCleanup = app.Option("--cleanup", "Set this flag to delete the newly checked out local repo once it has been processed.", CommandOptionType.NoValue);
 
-            app.OnExecute(() => Run(app, repos, reposFile, doCommit.HasValue() || createPullRequest.HasValue(), baseBranch, changesBranch, message, 
-                                    createPullRequest.HasValue(), command.Value));
+            app.OnExecute(() => Run(app, repos.Values, reposFile.Value(), doCommit.HasValue() || createPullRequest.HasValue(), 
+                                    baseBranch.Value(), changesBranch.Value(), message.Value(), createPullRequest.HasValue(),
+                                    doCleanup.HasValue(), command.Value));
 
             try
             {
