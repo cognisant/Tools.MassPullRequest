@@ -164,7 +164,7 @@ namespace MassPullRequest
                 finally
                 {
                     // Wether success or failure, clean up the cloned repository
-                    if (processor != null)
+                    if (cleanup && processor != null)
                     {
                         processor.Cleanup();
                     }
