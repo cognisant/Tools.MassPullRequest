@@ -18,11 +18,11 @@ namespace MassPullRequest
         {
             var app = new CommandLineApplication();
             app.Name = "MassPullRequest";
-            app.Description = "Clones then executes an action accross a number of GitHub repositories, optionally committing and creatign a PR with any changes";
+            app.Description = "Clones then executes an action accross a number of GitHub repositories, optionally committing and creating a PR with any changes";
 
             app.HelpOption("-?|-h|--help");
 
-            var command = app.Argument("Command", "The command to be executed on each repostitory, executed via powershell on windows, bash elsewhere.", false);
+            var command = app.Argument("Command", "The command to be executed on each repository, executed via powershell on windows, bash elsewhere.", false);
 
             var repos = app.Option(
                 "--repo <url>",
@@ -46,7 +46,7 @@ namespace MassPullRequest
 
             var doPush = app.Option(
                 "--push",
-                "Set this flag to push changes to the remote repository.",
+                "Set this flag to push changes to the remote repository. Implies --commit.",
                 CommandOptionType.NoValue);
 
             var changesBranch = app.Option(
