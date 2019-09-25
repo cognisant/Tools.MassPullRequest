@@ -50,6 +50,11 @@ namespace MassPullRequest
                 "Set this flag to create a commit with changes to the repository. If using this flag, a commit message must be set with --commit-message.",
                 CommandOptionType.NoValue);
 
+            var doPush = app.Option(
+                "--push",
+                "Set this flag to push changes to the remote repository.",
+                CommandOptionType.NoValue);
+
             var changesBranch = app.Option(
                 "--changes-branch <branchName>",
                 "The branch name on which to commit changes caused by the specified command. To be used in conjunction with --commit or --pull-request.",
@@ -60,9 +65,9 @@ namespace MassPullRequest
                 "The message to use when commiting changes. Required when using --commit or --pull-request.",
                 CommandOptionType.SingleValue);
 
-            var createPullRequest = app.Option(
+            var doPullRequest = app.Option(
                 "--pull-request",
-                "Set this flag to create a pull request with changes to the repository. If using this flag, branch name and commit message must be set with --changes-branch and --commit-message. Implies --commit.",
+                "Set this flag to create a pull request with changes to the repository. If using this flag, branch name and commit message must be set with --changes-branch and --commit-message. Implies --commit and --push.",
                 CommandOptionType.NoValue);
 
             var doCleanup = app.Option(
@@ -74,11 +79,12 @@ namespace MassPullRequest
                 app,
                 repos.Values,
                 reposFile.Value(),
-                doCommit.HasValue() || createPullRequest.HasValue(),
+                doCommit.HasValue() || doPush.HasValue() || doPullRequest.HasValue(), // PR and push imply commit
                 baseBranch.Value(),
                 changesBranch.Value(),
                 message.Value(),
-                createPullRequest.HasValue(),
+                doPush.HasValue() || doPullRequest.HasValue(),
+                doPullRequest.HasValue(),
                 doCleanup.HasValue(),
                 command.Value));
 
@@ -96,7 +102,7 @@ namespace MassPullRequest
             }
         }
 
-        private static int Run(CommandLineApplication app, List<string> repos, string reposFile, bool doCommit, string baseBranchName, string changesBranchName, string commitMessage, bool createPr, bool cleanup, string commandToRun)
+        private static int Run(CommandLineApplication app, List<string> repos, string reposFile, bool doCommit, string baseBranchName, string changesBranchName, string commitMessage, bool push, bool createPr, bool cleanup, string commandToRun)
         {
             if (!TryLoadUrls(repos, reposFile, out var urls))
             {
@@ -127,44 +133,46 @@ namespace MassPullRequest
 
             foreach (var repoUrl in urls)
             {
-                string clonePath = null;
+                RepositoryProcessor processor = null;
                 try
                 {
-                    var (repo, path) = CloneRepository(repoUrl, credentials);
-                    clonePath = path;
+                    processor = new RepositoryProcessor(repoUrl, credentials);
 
                     if (!string.IsNullOrWhiteSpace(baseBranchName))
                     {
-                        CheckoutBaseBranch(repo, baseBranchName);
+                        processor.CheckoutBaseBranch(baseBranchName);
                     }
 
-                    var baseBranch = repo.Branches[repo.Head.FriendlyName];
+                    if (!string.IsNullOrWhiteSpace(changesBranchName))
+                    {
+                        processor.CreateChangesBranch(changesBranchName);
+                    }
 
-                    RunCommand(repoUrl, repo, commandToRun);
+                    processor.RunCommand(commandToRun);
 
-                    var changes = repo.RetrieveStatus(new LibGit2Sharp.StatusOptions());
-                    if (!doCommit || !changes.Any())
+                    if (!doCommit || !processor.HasChanges)
                     {
                         continue;
                     }
 
-                    Console.WriteLine($"Committing {changes.Count()} changed files.");
+                    processor.Commit(commitMessage);
 
-                    var changesBranch = CheckoutChangesBranch(repo, changesBranchName);
-                    CreateCommit(repo, commitMessage, credentials);
-                    PushChanges(repo, changesBranch, credentials);
+                    if (push)
+                    {
+                        processor.Push();
+                    }
 
                     if (createPr)
                     {
-                        CreatePullRequest(repoUrl, repo, baseBranch, changesBranch, commitMessage, credentials);
+                        processor.CreatePullRequest(commitMessage);
                     }
                 }
                 finally
                 {
                     // Wether success or failure, clean up the cloned repository
-                    if (!string.IsNullOrWhiteSpace(clonePath) && cleanup)
+                    if (processor != null)
                     {
-                        new DirectoryInfo(clonePath).Delete(true);
+                        processor.Cleanup();
                     }
                 }
             }
@@ -182,141 +190,6 @@ namespace MassPullRequest
 
             var credentials = new UsernamePasswordCredentials() { Username = userName, Password = password };
             return credentials;
-        }
-
-        private static (Repository repo, string clonePath) CloneRepository(Uri url, UsernamePasswordCredentials credentials)
-        {
-            Console.WriteLine($"Cloning {url}");
-            var co = new CloneOptions { CredentialsProvider = (x, y, z) => credentials };
-
-            var cloneDirectory = Path.Combine(".", url.ToString().Split("/").Last(x => !string.IsNullOrWhiteSpace(x)));
-            var repoPath = Repository.Clone(url.ToString(), cloneDirectory, co);
-            return (new Repository(repoPath), cloneDirectory);
-        }
-
-        private static void CheckoutBaseBranch(Repository repo, string branchName)
-        {
-            var localBranch = repo.Branches[branchName];
-
-            if (localBranch == null)
-            {
-                // Probably a remote branch
-                Branch trackedBranch = repo.Branches[$"origin/{branchName}"];
-
-                if (trackedBranch == null)
-                {
-                    throw new Exception($"Branch {branchName} not found locally or on origin.");
-                }
-
-                localBranch = repo.CreateBranch(branchName, trackedBranch.Tip);
-                repo.Branches.Update(localBranch, b => b.UpstreamBranch = $"refs/heads/{branchName}");
-            }
-
-            Commands.Checkout(repo, repo.Branches[branchName]);
-        }
-
-        private static void RunCommand(Uri url, Repository repo, string command)
-        {
-            var cloneDirectory = url.ToString().Split("/").Last(x => !string.IsNullOrWhiteSpace(x));
-            var runner = RuntimeInformation.IsOSPlatform(OSPlatform.Windows) ? "powershell" : "/bin/bash";
-
-            var escapedArgs = command.Replace("\"", "\\\"");
-
-            var process = new Process()
-            {
-                StartInfo = new ProcessStartInfo
-                {
-                    FileName = runner,
-                    Arguments = $"{(runner == "powershell" ? "-Command" : "-c")} \"{escapedArgs}\"",
-                    RedirectStandardOutput = true,
-                    RedirectStandardError = true,
-                    UseShellExecute = false,
-                    CreateNoWindow = true,
-                    WorkingDirectory = Path.Combine(".", cloneDirectory),
-                },
-            };
-
-            process.OutputDataReceived += (sender, data) => Console.WriteLine(data.Data);
-            process.ErrorDataReceived += (sender, data) => Console.WriteLine(data.Data);
-
-            process.Start();
-            process.BeginOutputReadLine();
-            process.BeginErrorReadLine();
-            process.WaitForExit();
-        }
-
-        private static Branch CheckoutChangesBranch(Repository repo, string changesBranch)
-        {
-            // need to make sure that the changes branch name is unique both locally and remote
-            // if branch name is taken we'll try branchname-2, branchname-3 etc
-            var branchName = changesBranch;
-            Branch localBranch;
-            Branch trackedBranch;
-
-            var i = 0;
-            do
-            {
-                i++;
-                branchName = $"{changesBranch}{(i == 1 ? string.Empty : "-" + i)}";
-                localBranch = repo.Branches[branchName];
-                trackedBranch = repo.Branches[$"origin/{branchName}"];
-            }
-            while (localBranch != null || trackedBranch != null);
-
-            if (i != 1)
-            {
-                Console.WriteLine($"Branch name {changesBranch} was in use, checked out {changesBranch}-{i} instead.");
-            }
-
-            localBranch = repo.CreateBranch(branchName);
-            repo.Branches.Update(localBranch, b => b.UpstreamBranch = $"refs/heads/{branchName}");
-
-            Commands.Checkout(repo, repo.Branches[branchName]);
-
-            return localBranch;
-        }
-
-        private static void CreateCommit(Repository repo, string commitMessage, UsernamePasswordCredentials credentials)
-        {
-            Commands.Stage(repo, "*"); // equivalent of "git add ."
-
-            // We need to specify the author for the commit, grab it from config
-            Configuration config = repo.Config;
-            Signature author = config.BuildSignature(DateTimeOffset.Now);
-            repo.Commit(commitMessage, author, author);
-        }
-
-        private static void PushChanges(Repository repo, Branch branchToPush, UsernamePasswordCredentials credentials)
-        {
-            Console.WriteLine("Pushing changes.");
-            repo.Branches.Update(branchToPush, b =>
-            {
-                b.UpstreamBranch = branchToPush.CanonicalName;
-                b.Remote = repo.Network.Remotes["origin"].Name;
-            });
-
-            PushOptions options = new PushOptions() { CredentialsProvider = (x, y, z) => credentials };
-
-            repo.Network.Push(branchToPush, options);
-        }
-
-        private static void CreatePullRequest(Uri url, Repository checkoutDir, Branch baseBranch, Branch changesBranch, string commitMessage, UsernamePasswordCredentials credentials)
-        {
-            // we will need to use octokit for this
-            Console.WriteLine($"Sending pull request for {changesBranch.FriendlyName} -> {baseBranch.FriendlyName}");
-
-            var githubCredentials = new Octokit.Credentials(credentials.Username, credentials.Password);
-
-            var client = new GitHubClient(new ProductHeaderValue("MassPullRequest")) { Credentials = githubCredentials };
-
-            // octokit can only get a repo by owner + name, so we need to chop up the url
-            var urlParts = url.AbsolutePath.Split("/").Where(s => !string.IsNullOrWhiteSpace(s)).ToList();
-            var repoName = urlParts.Last();
-            var owner = urlParts[urlParts.Count - 2];
-
-            var pr = new NewPullRequest(commitMessage, changesBranch.Reference.CanonicalName, baseBranch.Reference.CanonicalName);
-
-            client.PullRequest.Create(owner, repoName, pr).Wait();
         }
 
         private static string GetHiddenConsoleInput()
@@ -350,7 +223,8 @@ namespace MassPullRequest
 
             repoList.AddRange(repos);
 
-            if (!string.IsNullOrWhiteSpace(reposFile))            {
+            if (!string.IsNullOrWhiteSpace(reposFile))
+            {
                 if (File.Exists(reposFile))
                 {
                     repoList.AddRange(File.ReadAllLines(reposFile).Where(l => !string.IsNullOrWhiteSpace(l)));
