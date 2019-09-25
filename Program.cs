@@ -6,17 +6,11 @@ namespace MassPullRequest
 {
     using System;
     using System.Collections.Generic;
-    using System.Diagnostics;
     using System.IO;
     using System.Linq;
-    using System.Runtime.InteropServices;
     using System.Text;
     using LibGit2Sharp;
     using Microsoft.Extensions.CommandLineUtils;
-    using Octokit;
-    using Branch = LibGit2Sharp.Branch;
-    using Repository = LibGit2Sharp.Repository;
-    using Signature = LibGit2Sharp.Signature;
 
     public static class Program
     {
