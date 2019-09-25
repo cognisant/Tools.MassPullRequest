@@ -83,7 +83,7 @@ namespace MassPullRequest
                 baseBranch.Value(),
                 changesBranch.Value(),
                 message.Value(),
-                doPush.HasValue() || doPullRequest.HasValue(),
+                doPush.HasValue() || doPullRequest.HasValue(), // PR implies push
                 doPullRequest.HasValue(),
                 doCleanup.HasValue(),
                 command.Value));
