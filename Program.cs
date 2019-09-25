@@ -178,7 +178,7 @@ namespace MassPullRequest
         {
             Console.Write("Enter git username: ");
             var userName = Console.ReadLine();
-            Console.Write("Enter git password: ");
+            Console.Write("Enter git password (or personal access token): ");
             var password = GetHiddenConsoleInput();
             Console.WriteLine();
 
