@@ -169,7 +169,7 @@ namespace MassPullRequest
             var repoName = urlParts.Last();
             var owner = urlParts[urlParts.Count - 2];
 
-            var pr = new NewPullRequest(pullRequestTitle, _changesBranch.Reference.CanonicalName, _baseBranch.Reference.CanonicalName);
+            var pr = new NewPullRequest(pullRequestTitle, _changesBranch.FriendlyName, _baseBranch.FriendlyName);
 
             client.PullRequest.Create(owner, repoName, pr).Wait();
         }
